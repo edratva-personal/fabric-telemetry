@@ -1,8 +1,10 @@
-version: "3.8"
 services:
   data-server:
-    build: ./data_server
-    ports: ["9001:9001"]
+    build:
+      context: .
+      dockerfile: data_server/Dockerfile
+    ports:
+      - "9001:9001"
     environment:
       DATA_SWITCHES: "64"
       DATA_INTERVAL_SEC: "10"
@@ -10,8 +12,11 @@ services:
       FAULT_SLOW_MS: "0"
 
   metrics-server:
-    build: ./metrics_server
-    ports: ["8080:8080"]
+    build:
+      context: .
+      dockerfile: metrics_server/Dockerfile
+    ports:
+      - "8080:8080"
     environment:
       UPSTREAM_URL: "http://data-server:9001/counters"
       POLL_MS: "1500"
