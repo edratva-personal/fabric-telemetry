@@ -50,22 +50,52 @@ docker compose version   # verify Compose v2 is available
 ## Running locally & with Docker
 
 ### Local (venv)
+
+1) Create venv & install deps
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
+```
 
-# Terminal A — data server
+2) **Configure via `.env` (recommended)** — this sets both services’ runtime knobs:
+```bash
+cp .env.example .env
+# edit .env if needed; defaults are sensible:
+# DATA_SWITCHES=64
+# DATA_INTERVAL_SEC=10
+# FAULT_500_PCT=0
+# FAULT_SLOW_MS=0
+# UPSTREAM_URL=http://127.0.0.1:9001/counters
+# POLL_MS=1500
+# LOG_LEVEL=INFO
+
+# export everything in this shell:
+set -a; source .env; set +a
+```
+
+3) Start **data server** (Terminal A)
+```bash
 python -m data_server.app
+# listens on 0.0.0.0:9001; CSV at /counters
+```
 
-# Terminal B — metrics server
-UPSTREAM_URL=http://127.0.0.1:9001/counters uvicorn metrics_server.app:app --host 0.0.0.0 --port 8080
+4) Start **metrics server** (Terminal B)
+```bash
+# in a new shell: set -a; source .env; set +a
+uvicorn metrics_server.app:app --host 0.0.0.0 --port 8080
+```
 
-# Try it
+5) Try it
+```bash
 curl -s http://127.0.0.1:8080/health
 curl -s http://127.0.0.1:8080/telemetry/ListMetrics | jq '.fields, .items[0]'
 curl -s 'http://127.0.0.1:8080/telemetry/GetMetric?switch_id=sw-000&metric=cpu_util_pct' | jq
 ```
+
+> Tip: For quick demos, set `DATA_INTERVAL_SEC=3` and `POLL_MS=1000` in `.env`.
+
+---
 
 ### Docker (Compose v2)
 ```bash
@@ -73,8 +103,6 @@ docker compose up --build
 # Try it from host
 curl -s http://127.0.0.1:8080/health
 ```
-
-> Inside Compose, the metrics server uses `UPSTREAM_URL=http://data-server:9001/counters`.
 
 ---
 
@@ -99,22 +127,21 @@ sw-001,118.3,9.9,1,36.5,64.2,31.0,0,47.9
 ```
 
 HTTP response headers carry **freshness & identity**:
-
 - `ETag`: snapshot ID (pollers use `If-None-Match` → 304 when unchanged)
 - `X-Snapshot-Ts` (epoch ms)
 - `Cache-Control: no-store`
 
-Fault injection knobs:
+Fault injection options:
 - `FAULT_500_PCT` → percentage of requests to fail with 500
 - `FAULT_SLOW_MS` → extra latency on ~20% of requests
 
 ### Data handling & REST server (consumer)
 
-The **metrics_server** runs an async poller:
-- Uses `If-None-Match` to avoid re-downloading unchanged data (sees **304** quickly)
-- Parses CSV, builds `{ switch_id -> { metric -> value } }`
-- Swaps in a new in-memory **Snapshot** atomically (protected by an `asyncio.Lock`)
-- On errors, continues serving the **last good snapshot** (with increasing staleness)
+The **metrics_server** runs an async **poller**:
+- Sends `If-None-Match` to avoid re-downloading unchanged data (sees fast **304**).
+- On **200 OK**, parses CSV and builds `{ switch_id -> { metric -> value } }`.
+- Swaps in a new in-memory **Snapshot** atomically (guarded by an `asyncio.Lock`).
+- On errors, continues serving the **last good snapshot** (with increasing staleness).
 
 API endpoints:
 - `GET /telemetry/ListMetrics` → full table (flattened list of rows)
@@ -122,7 +149,21 @@ API endpoints:
 - `GET /stats` → p50/p95/p99/max per endpoint + poller timing/retry counters
 - `GET /health` → liveness
 
-Both servers log structured **NDJSON** to stdout (see Observability below).
+> **Why FastAPI here?** The consumer does background polling and handles potentially many simultaneous requests. **FastAPI (ASGI)** + **Uvicorn** fits this **async I/O** pattern and yields excellent concurrency with minimal code.
+
+### Serving stack: Gunicorn (Flask) & Uvicorn (FastAPI)
+
+- **Flask data_server → Gunicorn (WSGI)**  
+  Command (Docker):  
+  `gunicorn -w 1 -b 0.0.0.0:9001 data_server.app:create_app()`  
+  One worker is enough for the generator; you can scale workers if needed.
+
+- **FastAPI metrics_server → Uvicorn (ASGI)**  
+  Command (Docker):  
+  `uvicorn metrics_server.app:app --host 0.0.0.0 --port 8080`  
+  Add `--workers N` to utilize multiple CPU cores under heavy load.
+
+Both servers emit structured JSON logs (NDJSON) to stdout.
 
 ---
 
@@ -149,36 +190,14 @@ fabric-telemetry/
 
 ---
 
-## Configuration
-
-Copy `.env.example` → `.env` and adjust if desired. Common knobs:
-
-**Data server**
-- `DATA_SWITCHES` (64) — number of switches
-- `DATA_INTERVAL_SEC` (10) — generation period
-- `FAULT_500_PCT` (0), `FAULT_SLOW_MS` (0) — fault injection
-- `PORT` (9001)
-
-**Metrics server**
-- `UPSTREAM_URL` (`http://127.0.0.1:9001/counters` or `http://data-server:9001/counters` in Docker)
-- `POLL_MS` (1500) — poll cadence (**<** data interval for steady 200/304 pattern)
-- `LOG_LEVEL` (INFO)
-- `PORT` (8080)
-
-> Simplicity note: config is parsed with tiny helpers (e.g., `int_env`) and minimal checks. In production, you’d wrap config in a `dataclass` or **Pydantic `BaseSettings`** for stricter typing/validation and better docs.
-
----
-
 ## API reference
 
 ### data_server (Flask, :9001)
-
 - **GET `/counters`** → `text/csv`  
   Headers: `ETag`, `X-Snapshot-Ts`, `Cache-Control: no-store`  
   Supports `If-None-Match` → **304** when unchanged.
 
 ### metrics_server (FastAPI, :8080)
-
 - **GET `/telemetry/ListMetrics`** → JSON  
   Headers: `X-Data-Age-Ms`, `ETag`  
   Payload: `{ snapshot_id, age_ms, fields[], items[] }`
@@ -205,36 +224,32 @@ Copy `.env.example` → `.env` and adjust if desired. Common knobs:
 
 ---
 
-## Running & development
+## Performance notes
 
-### Makefile shortcuts
-```bash
-make dev          # create .venv & install deps
-make run-data     # start data_server locally
-make run-metrics  # start metrics_server locally
-```
+- **Generator frequency vs. poll cadence.**  
+  Keep `POLL_MS` lower than `DATA_INTERVAL_SEC*1000` to benefit from **304** responses between updates. Example: generator every **10s**, poll every **1.5s** → pattern of `200, 304, 304, …`.
 
-### Docker hot-reload (optional, dev)
-Add `docker-compose.override.yml`:
-```yaml
-services:
-  data-server:
-    volumes: [ "./data_server:/app/data_server" ]
-    command: >
-      gunicorn --reload -b 0.0.0.0:9001 data_server.app:create_app()
-  metrics-server:
-    volumes: [ "./metrics_server:/app/metrics_server" ]
-    command: >
-      uvicorn metrics_server.app:app --host 0.0.0.0 --port 8080 --reload
-```
-Then `docker compose up` will hot-reload on `.py` changes.
+- **“Many generator threads?”**  
+  The producer is intentionally single-threaded per process to avoid write races. If you add multiple generator threads or multiple Gunicorn workers:
+  - Ensure updates are **atomic** (e.g., build a full snapshot in a local variable, then swap).
+  - If you run multiple **workers** for the data server, each worker produces its **own** stream; load balancers may serve different snapshots across requests. That’s fine for a demo, but for consistency you’d centralize generation or back it with a shared store (Redis).
+
+- **“Too many requests?”**  
+  - **GetMetric** is O(1) lookups in memory and very cheap; it scales with the number of workers.  
+  - **ListMetrics** serializes the whole snapshot; large switch counts inflate payload size and JSON encoding time. Under heavy load:
+    - Add **more Uvicorn workers** (`--workers N`) to use multiple CPU cores.
+    - Consider **pagination** or **field filtering** to reduce response size.
+    - Prefer **binary/cached** representations (see “Ideas to scale”).
+
+- **CPU vs. I/O bound.**  
+  FastAPI + Uvicorn shines with I/O-bound concurrency (many simultaneous clients). For CPU-heavy work (big JSON dumps, parsing), add workers and/or push heavy tasks off the main loop.
 
 ---
 
-## Performance notes
+## Performance targets (local ballpark)
 
-- Goals (local): `/telemetry/GetMetric` p95 ≲ ~5–7ms at ~100 concurrent requests; keep serving during upstream hiccups (with increasing `X-Data-Age-Ms`).
-- Use `/stats` for a quick view; for load, `hey` or `wrk` scripts can be added later.
+- `/telemetry/GetMetric`: **p95 ≲ ~5–7 ms** at ~100 concurrent requests on a laptop-class CPU.
+- `/telemetry/ListMetrics`: increases with switch count and fields; consider paging past a few thousand switches.
 
 ---
 
@@ -249,13 +264,28 @@ Then `docker compose up` will hot-reload on `.py` changes.
 
 ## Ideas to scale / harden
 
-- **Throughput:** multi-worker (`uvicorn --workers N`), `uvloop`, `orjson`; parse CSV off-loop.
-- **Fault tolerance:** backoff with jitter on poll failures; circuit breaker; `MAX_STALE_MS` policy.
-- **Scalability:** stateless metrics servers behind a LB; shared cache (Redis); sharding; pagination; Prometheus `/metrics`; Grafana dashboards; SSE/WebSocket for near-real-time.
+**Throughput & latency**
+- Run multiple **Uvicorn workers**; pin worker count to CPU cores.
+- Use **orjson** for faster JSON, **uvloop** for event loop performance.
+- **Cache** the `ListMetrics` JSON blob and only rebuild on snapshot changes.
+- **Pagination** / server-side filtering to cap payload sizes.
+- Pre-parse CSV off the main loop or switch to a **binary wire format** (e.g., protobuf/Arrow).
 
----
+**Fault tolerance**
+- Add **exponential backoff + jitter** on poll failures; cap with a **MAX_STALE_MS** policy (return 503 if data is too old).
+- **Circuit breaker** around the upstream to avoid thundering herds after outages.
+- Health/readiness endpoints that check **snapshot freshness** (not just liveness).
 
-## Submission notes
+**Scalability & architecture**
+- Make the data server **stateless** and persist snapshots in a shared cache (Redis/Memcached) or object store; have metrics servers read from there.
+- **Sharding**: split switches across multiple producers; compose the view in the consumer.
+- **Streaming**: add SSE/WebSocket or gRPC streaming to push updates instead of polling.
+- Move from CSV to **newline-delimited JSON** or protobuf for lower parse overhead.
 
-- **This repo is private.** Add reviewers as collaborators.
-- The top of this README includes **exact run instructions**; you can also paste the “Reviewer quickstart” section in your submission email for convenience.
+**Observability & ops**
+- Add **Prometheus** `/metrics` and prebuilt **Grafana** dashboards (poll cadence, staleness, request rate, latency percentiles).
+- Structured logs already exist; add **request IDs** and correlate poll → serve.
+
+**Security & policy**
+- **Rate limiting** and **auth** (e.g., bearer tokens) on the metrics server.
+- Input validation / schema versioning for the CSV.
