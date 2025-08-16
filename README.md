@@ -58,7 +58,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-2) **Configure via `.env` (recommended)** — this sets both services’ runtime knobs:
+2) **Configure via `.env` (recommended)** — this sets both services’ runtime options:
 ```bash
 cp .env.example .env
 # edit .env if needed; defaults are sensible:
