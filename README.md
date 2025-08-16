@@ -1,38 +1,145 @@
 # Fabric Telemetry
 
-A small, UFM-style **fabric telemetry** exercise with two services:
+Two small services modeled after NVIDIA UFM’s split between **telemetry producers** and **consumers**:
 
-- **data_server (Flask, :9001)** – simulates switch metrics and serves a **CSV matrix** at `/counters`.
-- **metrics_server (FastAPI, :8080)** – polls `/counters`, caches the latest snapshot, and serves:
+- **data_server (Flask, :9001)** → simulates fabric switch metrics and serves a CSV **matrix** at `/counters`.
+- **metrics_server (FastAPI, :8080)** → polls `/counters`, keeps the latest snapshot in memory, and serves:
   - `GET /telemetry/GetMetric?switch_id=&metric=`
   - `GET /telemetry/ListMetrics`
-  - `GET /stats` (roll-up latency stats)
-  - `GET /healthz`
-
-## Why two services?
-
-This mirrors a realistic producer/consumer split. You can test failure modes (timeouts, jitter, 500s), polling cadence vs. query cadence, staleness, and non-blocking behavior under concurrent requests.
+  - `GET /stats` (latency percentiles & poller stats)
+  - `GET /health`
 
 ---
 
-## Repo layout
+## Prerequisites (Ubuntu 20.04+)
+
+> Quick setup for a fresh machine. If you already have these, skip.
+
+### System tools
+```bash
+sudo apt-get update
+sudo apt-get install -y curl git jq ca-certificates gnupg lsb-release software-properties-common
+```
+
+### Python 3.11 + venv
+```bash
+# Add Deadsnakes PPA for Python 3.11 on Ubuntu 20.04
+sudo add-apt-repository -y ppa:deadsnakes/ppa
+sudo apt-get update
+sudo apt-get install -y python3.11 python3.11-venv python3.11-dev
+```
+
+### Docker Engine + Compose v2 (recommended)
+```bash
+# Install Docker’s official repo
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# Optional: run docker without sudo
+sudo usermod -aG docker $USER
+newgrp docker
+docker compose version   # verify Compose v2 is available
+```
+
+---
+
+## Running locally & with Docker
+
+### Local (venv)
+```bash
+python3.11 -m venv .venv && source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+
+# Terminal A — data server
+python -m data_server.app
+
+# Terminal B — metrics server
+UPSTREAM_URL=http://127.0.0.1:9001/counters uvicorn metrics_server.app:app --host 0.0.0.0 --port 8080
+
+# Try it
+curl -s http://127.0.0.1:8080/health
+curl -s http://127.0.0.1:8080/telemetry/ListMetrics | jq '.fields, .items[0]'
+curl -s 'http://127.0.0.1:8080/telemetry/GetMetric?switch_id=sw-000&metric=cpu_util_pct' | jq
+```
+
+### Docker (Compose v2)
+```bash
+docker compose up --build
+# Try it from host
+curl -s http://127.0.0.1:8080/health
+```
+
+> Inside Compose, the metrics server uses `UPSTREAM_URL=http://data-server:9001/counters`.
+
+---
+
+## How it works
+
+### Telemetry generation (producer)
+
+The **data_server** periodically synthesizes a snapshot for `N` switches (default **64**), producing **8 metrics** per switch:
+
+- `bandwidth_gbps`, `latency_us`, `packet_errors`
+- `cpu_util_pct`, `mem_util_pct`
+- `buffer_occupancy_pct`, `egress_drops_per_s`
+- `temperature_c`
+
+Every tick it emits a CSV “matrix”:
+
+```
+switch_id,bandwidth_gbps,latency_us,packet_errors,cpu_util_pct,mem_util_pct,buffer_occupancy_pct,egress_drops_per_s,temperature_c
+sw-000,121.5,11.2,0,34.1,59.8,28.6,1,46.7
+sw-001,118.3,9.9,1,36.5,64.2,31.0,0,47.9
+...
+```
+
+HTTP response headers carry **freshness & identity**:
+
+- `ETag`: snapshot ID (pollers use `If-None-Match` → 304 when unchanged)
+- `X-Snapshot-Ts` (epoch ms)
+- `Cache-Control: no-store`
+
+Fault injection knobs:
+- `FAULT_500_PCT` → percentage of requests to fail with 500
+- `FAULT_SLOW_MS` → extra latency on ~20% of requests
+
+### Data handling & REST server (consumer)
+
+The **metrics_server** runs an async poller:
+- Uses `If-None-Match` to avoid re-downloading unchanged data (sees **304** quickly)
+- Parses CSV, builds `{ switch_id -> { metric -> value } }`
+- Swaps in a new in-memory **Snapshot** atomically (protected by an `asyncio.Lock`)
+- On errors, continues serving the **last good snapshot** (with increasing staleness)
+
+API endpoints:
+- `GET /telemetry/ListMetrics` → full table (flattened list of rows)
+- `GET /telemetry/GetMetric?switch_id=&metric=` → single value
+- `GET /stats` → p50/p95/p99/max per endpoint + poller timing/retry counters
+- `GET /health` → liveness
+
+Both servers log structured **NDJSON** to stdout (see Observability below).
+
+---
+
+## Repository layout
 
 ```
 fabric-telemetry/
-├─ data_server/                 # Flask simulator
+├─ data_server/                 # Flask producer
 │  ├─ app.py
 │  ├─ simulator.py
-│  ├─ config.py
-│  └─ Dockerfile                # see Appendix A if missing
-├─ metrics_server/              # FastAPI metrics API
+│  └─ Dockerfile
+├─ metrics_server/              # FastAPI consumer
 │  ├─ app.py
 │  ├─ poller.py
 │  ├─ store.py
 │  ├─ logging.py
-│  ├─ stats.py
-│  └─ Dockerfile                # see Appendix A if missing
-├─ scripts/
-│  └─ demo.sh                   # (optional) demo helpers
+│  └─ stats.py
 ├─ requirements.txt
 ├─ docker-compose.yml
 ├─ Makefile
@@ -42,74 +149,23 @@ fabric-telemetry/
 
 ---
 
-## Requirements
+## Configuration
 
-- **Python 3.11** (Ubuntu 20.04 users: install via deadsnakes PPA)
-- **pip**
-- **Docker** & **Docker Compose** (optional, for containerized run)
-- **curl** (for quick tests), **jq** (optional)
+Copy `.env.example` → `.env` and adjust if desired. Common knobs:
 
----
+**Data server**
+- `DATA_SWITCHES` (64) — number of switches
+- `DATA_INTERVAL_SEC` (10) — generation period
+- `FAULT_500_PCT` (0), `FAULT_SLOW_MS` (0) — fault injection
+- `PORT` (9001)
 
-## Run (venv)
+**Metrics server**
+- `UPSTREAM_URL` (`http://127.0.0.1:9001/counters` or `http://data-server:9001/counters` in Docker)
+- `POLL_MS` (1500) — poll cadence (**<** data interval for steady 200/304 pattern)
+- `LOG_LEVEL` (INFO)
+- `PORT` (8080)
 
-```bash
-# one-time setup
-python3.11 -m venv .venv && source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-
-# terminal A — data server (Flask)
-python -m data_server.app
-
-# terminal B — metrics server (FastAPI)
-UPSTREAM_URL=http://127.0.0.1:9001/counters uvicorn metrics_server.app:app --host 127.0.0.1 --port 8080
-```
-
-With **Makefile**:
-```bash
-make dev
-make run-data
-make run-metrics
-```
-
----
-
-## Run (Docker)
-
-```bash
-docker compose up --build
-```
-
-- Host access:
-  - Data server: http://127.0.0.1:9001/counters
-  - Metrics server: http://127.0.0.1:8080/…
-- Inside Docker, the metrics server uses `UPSTREAM_URL=http://data-server:9001/counters` (service DNS name).
-
-Stop & clean:
-```bash
-docker compose down
-```
-
-> If you don’t have the Dockerfiles yet, copy them from **Appendix A** below.
-
----
-
-## Try it
-
-```bash
-# CSV snapshot (from data server)
-curl -s http://127.0.0.1:9001/counters | head
-
-# All metrics (from metrics server)
-curl -s 'http://127.0.0.1:8080/telemetry/ListMetrics' | jq
-
-# One metric
-curl -s 'http://127.0.0.1:8080/telemetry/GetMetric?switch_id=sw-000&metric=bandwidth_gbps' | jq
-
-# Stats (p50/p95/p99 per endpoint, last ~1000 samples)
-curl -s 'http://127.0.0.1:8080/stats' | jq
-```
+> Simplicity note: config is parsed with tiny helpers (e.g., `int_env`) and minimal checks. In production, you’d wrap config in a `dataclass` or **Pydantic `BaseSettings`** for stricter typing/validation and better docs.
 
 ---
 
@@ -117,186 +173,89 @@ curl -s 'http://127.0.0.1:8080/stats' | jq
 
 ### data_server (Flask, :9001)
 
-- **GET `/counters`** → `text/csv`
-  - Headers:
-    - `ETag`: snapshot id (string)
-    - `X-Snapshot-Ts`: epoch ms
-    - `Cache-Control: no-store`
-  - Supports `If-None-Match` (returns **304** if unchanged)
-  - **CSV format** (matrix; first row = header):
-    ```
-    switch_id,bandwidth_gbps,latency_us,packet_errors
-    sw-000,122.4,11.2,0
-    sw-001,118.7,10.8,1
-    ...
-    ```
+- **GET `/counters`** → `text/csv`  
+  Headers: `ETag`, `X-Snapshot-Ts`, `Cache-Control: no-store`  
+  Supports `If-None-Match` → **304** when unchanged.
 
 ### metrics_server (FastAPI, :8080)
 
-- **GET `/telemetry/ListMetrics`** → JSON
-  - Headers: `X-Data-Age-Ms`, `ETag`
-  - Response:
-    ```json
-    {
-      "snapshot_id": "1749",
-      "age_ms": 820,
-      "fields": ["bandwidth_gbps","latency_us","packet_errors"],
-      "items": [
-        {"switch_id":"sw-000","bandwidth_gbps":122.4,"latency_us":11.2,"packet_errors":0}
-      ]
-    }
-    ```
+- **GET `/telemetry/ListMetrics`** → JSON  
+  Headers: `X-Data-Age-Ms`, `ETag`  
+  Payload: `{ snapshot_id, age_ms, fields[], items[] }`
 
-- **GET `/telemetry/GetMetric?switch_id=sw-000&metric=bandwidth_gbps`** → JSON
-  - Headers: `X-Data-Age-Ms`, `ETag`
-  - Errors: **404** if `switch_id` or `metric` unknown; **503** if no snapshot yet.
-  - Response:
-    ```json
-    {"switch_id":"sw-000","metric":"bandwidth_gbps","value":122.4,"snapshot_id":"1749","age_ms":820}
-    ```
+- **GET `/telemetry/GetMetric?switch_id=...&metric=...`** → JSON  
+  Headers: `X-Data-Age-Ms`, `ETag`  
+  Errors: **404** (bad switch/metric), **503** (no snapshot yet)
 
-- **GET `/stats`** → JSON roll-up latencies (p50/p95/p99, max, count) for `ListMetrics` and `GetMetric`, plus poller stats.
+- **GET `/stats`** → JSON  
+  `endpoints` (p50/p95/p99/max/count), `poll_last_cycle_ms`, `poll_retry_count`, `uptime_s`
 
-- **GET `/healthz`** → `{ "ok": true }`
-
----
-
-## Configuration (env vars)
-
-### Data server
-
-| Var              | Default | Unit | Purpose |
-|---               |---      |---   |---|
-| `DATA_SWITCHES`  | `64`    | —    | Number of simulated switches |
-| `DATA_INTERVAL_SEC` | `10` | s    | Snapshot generation interval |
-| `FAULT_500_PCT`  | `0`     | %    | Chance that `/counters` returns 500 (fault injection) |
-| `FAULT_SLOW_MS`  | `0`     | ms   | Extra delay on ~20% of requests (jitter) |
-| `BIND_HOST`      | `0.0.0.0` | —  | Bind host (dev default) |
-| `PORT`           | `9001`  | —    | Port |
-
-### Metrics server
-
-| Var           | Default                              | Unit | Purpose |
-|---            |---                                   |---   |---|
-| `UPSTREAM_URL`| `http://127.0.0.1:9001/counters`     | URL  | Where to pull CSV (Compose uses `http://data-server:9001/counters`) |
-| `POLL_MS`     | `1500`                               | ms   | Poll cadence (should be **<** data interval) |
-| `LOG_LEVEL`   | `INFO`                               | —    | `DEBUG` \| `INFO` \| `WARN` \| `ERROR` |
-| `BIND_HOST`   | `0.0.0.0`                            | —    | Bind host |
-| `PORT`        | `8080`                               | —    | Port |
-
-> Copy `.env.example` to `.env` and edit if you like. The Makefile auto-loads `.env`.
-
-**Note on config typing & validation:** For simplicity in this exercise, config values are read via small helpers (e.g., `int_env`) and validated minimally. In a production service, you could wrap all config in a **dataclass** or a **Pydantic `BaseSettings`** model to: enforce types and ranges (e.g., clamp `FAULT_500_PCT` to `[0,100]`, ensure `DATA_INTERVAL_SEC >= 1`), provide automatic defaults and `.env` loading, and generate clearer documentation.
+- **GET `/health`** → `{ "ok": true }`
 
 ---
 
 ## Observability
 
-Both services log **structured JSON (NDJSON)** to stdout.
+**Structured JSON logs (NDJSON)** to stdout:
 
-- **data_server events**
-  - `gen.tick` — generator cycles (tick_ms, interval_ms, skew_ms, snapshot_id)
-  - `http.access` — `/counters` latency, bytes_sent, age_ms
-  - `gen.inject_fault` — when a 500 or delay is injected
+- *data_server* events: `gen.tick`, `http.access`, `gen.inject_fault`
+- *metrics_server* events: `startup`, `shutdown`, `poll.run`, `poll.error`, `http.access`
 
-- **metrics_server events**
-  - `startup` / `shutdown`
-  - `poll.run` — poll timing (fetch_ms / parse_ms / apply_ms / cycle_ms), status, retry count
-  - `poll.error` — any exceptions while polling
-  - `http.access` — per-request latency + current `age_ms` of data
-
-**Percentiles** (`/stats`): p50/p95/p99/max over a rolling window (~1000 recent samples) for the two main endpoints.
+`/stats` computes `p50`/`p95`/`p99` over a rolling window (~1000) for the two main endpoints and exposes basic poller stats (cycle time, retries).
 
 ---
 
-## Performance goals (to measure later)
+## Running & development
 
-- `/telemetry/GetMetric`: **p95 ≤ ~5–7 ms** locally at ~100 concurrent requests; p99 reasonable; near-zero errors.
-- Stable latency while the poller runs (non-blocking behavior).
-- On upstream slowness/outage: keep serving last snapshot with **staleness** (`X-Data-Age-Ms`), no stalls.
-
-> Use `/stats` for a quick view, or a load tool like `hey`. (You can add a `scripts/bench.sh` later.)
-
----
-
-## Troubleshooting
-
-- **`ModuleNotFoundError: flask`**
-  Activate the venv and install deps:  
-  `source .venv/bin/activate && pip install -r requirements.txt`
-
-- **Relative import errors** in `data_server/app.py`
-  Run as a **module**: `python -m data_server.app` (recommended), or switch the imports to absolute.
-
-- **`UPSTREAM_URL` inside Docker**
-  Use `http://data-server:9001/counters` (service name) — not `127.0.0.1`.
-
-- **Ports already in use**
-  Something else is bound to 9001/8080. Stop it or change `PORT`.
-
-- **No data yet (503)** from metrics server
-  Wait for the first poll (POLL_MS) and the simulator’s first tick (DATA_INTERVAL_SEC). Then retry.
-
----
-
-## Limitations
-
-- In-memory only (no persistence/history).
-- Single node, single snapshot (latest only).
-- CSV over HTTP for simplicity.
-- Minimal access controls.
-
----
-
-## Ideas for improvement
-
-**Throughput**
-- `uvicorn --loop uvloop`, reuse a single `httpx.AsyncClient`, enable `orjson`.
-- Offload large CSV parse to a threadpool; or switch the simulator to JSON/NDJSON.
-
-**Fault-tolerance**
-- Exponential backoff with jitter on poll failures; circuit breaker.
-- `MAX_STALE_MS` policy (503 when too stale).
-- Health/readiness endpoints + restart policy.
-
-**Scalability**
-- Stateless metrics servers behind a load balancer; shared cache (Redis).
-- Shard by `switch_id`; paginate `ListMetrics`.
-- Streaming (SSE/WebSocket) for near-real-time updates.
-- Prometheus `/metrics` (histograms for request/poll/freshness) + Grafana.
-
----
-
-## License / visibility
-
-This repo is intended for interview evaluation. Keep it **Private** and share with reviewers as collaborators.
-
----
-
-## Appendix A — Dockerfiles (copy if not already present)
-
-**`data_server/Dockerfile`**
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY data_server/ ./data_server/
-EXPOSE 9001
-USER nobody
-CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:9001", "data_server.app:create_app()"]
+### Makefile shortcuts
+```bash
+make dev          # create .venv & install deps
+make run-data     # start data_server locally
+make run-metrics  # start metrics_server locally
 ```
 
-**`metrics_server/Dockerfile`**
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY metrics_server/ ./metrics_server/
-EXPOSE 8080
-USER nobody
-CMD ["uvicorn", "metrics_server.app:app", "--host", "0.0.0.0", "--port", "8080"]
+### Docker hot-reload (optional, dev)
+Add `docker-compose.override.yml`:
+```yaml
+services:
+  data-server:
+    volumes: [ "./data_server:/app/data_server" ]
+    command: >
+      gunicorn --reload -b 0.0.0.0:9001 data_server.app:create_app()
+  metrics-server:
+    volumes: [ "./metrics_server:/app/metrics_server" ]
+    command: >
+      uvicorn metrics_server.app:app --host 0.0.0.0 --port 8080 --reload
 ```
+Then `docker compose up` will hot-reload on `.py` changes.
+
+---
+
+## Performance notes
+
+- Goals (local): `/telemetry/GetMetric` p95 ≲ ~5–7ms at ~100 concurrent requests; keep serving during upstream hiccups (with increasing `X-Data-Age-Ms`).
+- Use `/stats` for a quick view; for load, `hey` or `wrk` scripts can be added later.
+
+---
+
+## Limitations (explicit)
+
+- In-memory only (no persistence/history)
+- Single latest snapshot per process (no time-series)
+- No auth / RBAC
+- JSON/CSV only; no Prometheus or streaming yet
+
+---
+
+## Ideas to scale / harden
+
+- **Throughput:** multi-worker (`uvicorn --workers N`), `uvloop`, `orjson`; parse CSV off-loop.
+- **Fault tolerance:** backoff with jitter on poll failures; circuit breaker; `MAX_STALE_MS` policy.
+- **Scalability:** stateless metrics servers behind a LB; shared cache (Redis); sharding; pagination; Prometheus `/metrics`; Grafana dashboards; SSE/WebSocket for near-real-time.
+
+---
+
+## Submission notes
+
+- **This repo is private.** Add reviewers as collaborators.
+- The top of this README includes **exact run instructions**; you can also paste the “Reviewer quickstart” section in your submission email for convenience.
