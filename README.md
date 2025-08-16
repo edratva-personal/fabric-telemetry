@@ -1,6 +1,6 @@
 # Fabric Telemetry
 
-Two small services modeled after NVIDIA UFM’s split between **telemetry producers** and **consumers**:
+Two servers modeled after NVIDIA UFM’s split between **telemetry producers** and **consumers**:
 
 - **data_server (Flask, :9001)** → simulates fabric switch metrics and serves a CSV **matrix** at `/counters`.
 - **metrics_server (FastAPI, :8080)** → polls `/counters`, keeps the latest snapshot in memory, and serves:
@@ -58,7 +58,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-2) **Configure via `.env` (recommended)** — this sets both services’ runtime options (see details on FAULT_500_PCT and FAULT_SLOW_MS in How it Works below):
+2) **Configure via `.env` (recommended)** — this sets both services’ runtime options (see details on FAULT_500_PCT and FAULT_SLOW_MS in “How it Works“ section below):
 ```bash
 cp .env.example .env
 # edit .env if needed; defaults are sensible:
@@ -159,6 +159,9 @@ sw-001,118.3,9.9,1,36.5,64.2,31.0,0,47.9
 ...
 ```
 
+Race conditions:
+Snapshot generator loop and `/counters` endpoint are mutexed to ensure serving a correct snapshot
+
 HTTP response headers carry **freshness & identity**:
 - `ETag`: snapshot ID (pollers use `If-None-Match` → 304 when unchanged)
 - `X-Snapshot-Ts` (epoch ms)
@@ -206,6 +209,7 @@ Both servers emit structured JSON logs (NDJSON) to stdout.
 fabric-telemetry/
 ├─ data_server/                 # Flask producer
 │  ├─ app.py
+│  ├─ config.py
 │  ├─ simulator.py
 │  └─ Dockerfile
 ├─ metrics_server/              # FastAPI consumer
@@ -216,7 +220,6 @@ fabric-telemetry/
 │  └─ stats.py
 ├─ requirements.txt
 ├─ docker-compose.yml
-├─ Makefile
 ├─ .env.example
 └─ README.md
 ```
@@ -286,39 +289,47 @@ fabric-telemetry/
 
 ---
 
-## Limitations (explicit)
+## Limitations
 
-- In-memory only (no persistence/history)
+- In-memory only (no persistence)
 - Single latest snapshot per process (no time-series)
-- No auth / RBAC
-- JSON/CSV only; no Prometheus or streaming yet
+- No authentication between servers
+- No authenticaiton between the Metrics server and its users
+- Non-reproducible builds (I didn't use pip freeze or poetry)
 
 ---
 
 ## Ideas to scale / harden
 
-**Throughput & latency**
-- Run multiple **Uvicorn workers**; pin worker count to CPU cores.
-- Use **orjson** for faster JSON, **uvloop** for event loop performance.
-- **Cache** the `ListMetrics` JSON blob and only rebuild on snapshot changes.
-- **Pagination** / server-side filtering to cap payload sizes.
-- Pre-parse CSV off the main loop or switch to a **binary wire format** (e.g., protobuf/Arrow).
+**Throughput & latency** - Run multiple **Uvicorn workers**, usually
+matching the number of CPU cores. - Use faster libraries like **orjson**
+(for JSON) and **uvloop** (for the event loop). - **Cache** the
+`ListMetrics` JSON response and only rebuild when snapshots change. -
+Add **pagination** and server-side filters so responses don't get too
+big. - Parse CSV in a background thread/process, or switch to a faster
+format (e.g. protobuf or Arrow).
 
-**Fault tolerance**
-- Add **exponential backoff + jitter** on poll failures; cap with a **MAX_STALE_MS** policy (return 503 if data is too old).
-- **Circuit breaker** around the upstream to avoid thundering herds after outages.
-- Health/readiness endpoints that check **snapshot freshness** (not just liveness).
+**Fault tolerance** - Retry failed polls with **exponential backoff and
+random delay**; stop serving if data is older than a safe limit (return
+503). - Add a **circuit breaker** so clients don't overload the upstream
+when it recovers. - Health/readiness endpoints should check **data
+freshness**, not just that the process is alive.
 
-**Scalability & architecture**
-- Make the data server **stateless** and persist snapshots in a shared cache (Redis/Memcached) or object store; have metrics servers read from there.
-- **Sharding**: split switches across multiple producers; compose the view in the consumer.
-- **Streaming**: add SSE/WebSocket or gRPC streaming to push updates instead of polling.
-- Move from CSV to **newline-delimited JSON** or protobuf for lower parse overhead.
+**Scalability & architecture** - Keep the server **stateless**. Store
+snapshots in Redis, Memcached, or object storage, and let metrics
+servers read from there. - Use **sharding**: divide switches across
+multiple producers, then combine results in the consumer. - Add
+**streaming** (SSE, WebSocket, or gRPC) so clients can get updates in
+real time instead of polling. - Move from CSV to **newline-delimited
+JSON** or protobuf for faster parsing.
 
-**Observability & ops**
-- Add **Prometheus** `/metrics` and prebuilt **Grafana** dashboards (poll cadence, staleness, request rate, latency percentiles).
-- Structured logs already exist; add **request IDs** and correlate poll → serve.
+**Observability & ops** - Expose a **Prometheus** `/metrics` endpoint
+and provide ready-to-use **Grafana** dashboards (showing poll rate,
+staleness, request counts, latency, etc.). - Use structured logs with
+**request IDs**, so you can trace a request from poll to serve.
 
-**Security & policy**
-- **Rate limiting** and **auth** (e.g., bearer tokens) on the metrics server.
-- Input validation / schema versioning for the CSV.
+**Security & policy** - Add **rate limiting** on the metrics server to
+prevent overload or abuse. - Use **HTTPS** so the client can verify the
+server, and use **API keys** so the server can verify the client. -
+Validate CSV input strictly and include a **schema version** so the
+format can evolve safely.
