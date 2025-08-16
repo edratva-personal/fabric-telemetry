@@ -51,14 +51,17 @@ docker compose version   # verify Compose v2 is available
 
 ### Local (venv)
 
-1) Create venv & install deps
+1) Open two Terminal windows (Terminal A and Terminal B), navigate to repo root in both. Steps 2 through 4 below are for Terminal A.
+
+
+2) Create venv & install deps
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-2) **Configure via `.env` (recommended)** — this sets both services’ runtime options (see details on FAULT_500_PCT and FAULT_SLOW_MS in “How it Works“ section below):
+3) **Configure via `.env` (recommended)** — this sets both services’ runtime options (see details on FAULT_500_PCT and FAULT_SLOW_MS in “How it Works“ section below):
 ```bash
 cp .env.example .env
 # edit .env if needed; defaults are sensible:
@@ -74,19 +77,20 @@ cp .env.example .env
 set -a; source .env; set +a
 ```
 
-3) Start **data server** (Terminal A)
+4) Start **data server**
 ```bash
 python -m data_server.app
 # listens on 0.0.0.0:9001; CSV at /counters
 ```
 
-4) Start **metrics server** (Terminal B)
+5) Start **metrics server** (Terminal B)
 ```bash
-# in a new shell: set -a; source .env; set +a
+python3.11 -m venv .venv && source .venv/bin/activate
+set -a; source .env; set +a
 uvicorn metrics_server.app:app --host 0.0.0.0 --port 8080
 ```
 
-5) Try it
+6) Try it
 ```bash
 curl -s http://127.0.0.1:8080/health
 curl -s http://127.0.0.1:8080/telemetry/ListMetrics | jq '.fields, .items[0]'
