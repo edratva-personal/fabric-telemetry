@@ -11,7 +11,7 @@ Two small services modeled after NVIDIA UFM’s split between **telemetry produc
 
 ---
 
-## Prerequisites (Ubuntu 20.04+)
+## Prerequisites (Ubuntu 20.04+ / Debian-based)
 
 > Quick setup for a fresh machine. If you already have these, skip.
 
@@ -58,7 +58,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-2) **Configure via `.env` (recommended)** — this sets both services’ runtime options (see details on FAULT_500_PCT and FAULT_SLOW_MS in How it Works below):
+2) **Configure via `.env` (recommended)** — this sets both services’ runtime knobs:
 ```bash
 cp .env.example .env
 # edit .env if needed; defaults are sensible:
@@ -137,6 +137,25 @@ docker compose up --build
 curl -s http://127.0.0.1:8080/health
 ```
 
+Change runtime config later by editing the `environment:` blocks, then:
+```bash
+docker compose up -d --force-recreate
+```
+
+**Dev hot-reload (optional):** create `docker-compose.override.yml` to bind-mount code & enable auto-reload:
+```yaml
+services:
+  data-server:
+    volumes: [ "./data_server:/app/data_server" ]
+    command: >
+      gunicorn --reload -b 0.0.0.0:9001 data_server.app:create_app()
+  metrics-server:
+    volumes: [ "./metrics_server:/app/metrics_server" ]
+    command: >
+      uvicorn metrics_server.app:app --host 0.0.0.0 --port 8080 --reload
+```
+Then run `docker compose up` and edit `.py` files freely.
+
 ---
 
 ## How it works
@@ -164,9 +183,11 @@ HTTP response headers carry **freshness & identity**:
 - `X-Snapshot-Ts` (epoch ms)
 - `Cache-Control: no-store`
 
-Fault injection options:
+Fault injection knobs:
 - `FAULT_500_PCT` → percentage of requests to fail with 500
 - `FAULT_SLOW_MS` → extra latency on ~20% of requests
+
+> **Why Flask here?** The data server is a tiny, synchronous CSV producer. Flask’s simple WSGI model, minimal dependencies, and ecosystem around **Gunicorn** make it straightforward and reliable for this role.
 
 ### Data handling & REST server (consumer)
 
@@ -176,7 +197,7 @@ The **metrics_server** runs an async **poller**:
 - Swaps in a new in-memory **Snapshot** atomically (guarded by an `asyncio.Lock`).
 - On errors, continues serving the **last good snapshot** (with increasing staleness).
 
-API endpoints:
+Public API:
 - `GET /telemetry/ListMetrics` → full table (flattened list of rows)
 - `GET /telemetry/GetMetric?switch_id=&metric=` → single value
 - `GET /stats` → p50/p95/p99/max per endpoint + poller timing/retry counters
